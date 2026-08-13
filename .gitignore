@@ -24,8 +24,6 @@ npm-debug.log*
 # Editors and OS noise
 .idea/
 .vscode/
-.claude/
-CLAUDE.md
 .DS_Store
 *.swp
 *.swo
