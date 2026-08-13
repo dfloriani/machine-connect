@@ -124,6 +124,31 @@ already have and only flipping `acknowledged` fixes it.
 lets clients shape their own queries, so the server sets a depth limit, a rate
 limit, and validates telemetry payloads before anything reaches the database.
 
+## Retention
+
+Telemetry is the only table that grows without bound, so it is partitioned by
+UTC day and old partitions are dropped on a schedule. `TELEMETRY_RETENTION_DAYS`
+sets the window and defaults to 30.
+
+This applies to raw sensor samples only. Alerts are kept indefinitely, so the
+record of what went wrong on a machine outlives the readings that triggered it.
+
+Dropping a partition is a catalog operation, unlike a bulk `DELETE`, which would
+write as much WAL as the rows it removes and leave the space for vacuum to
+reclaim. Maintenance runs at startup and every six hours: it creates the
+partitions for the next few days, so an insert never arrives before its
+partition exists, and drops any whose day has fallen outside the window.
+Because partitions are dropped whole, up to one extra day is kept.
+
+```bash
+docker compose exec postgres psql -U app -d machineconnect -c "\d+ telemetry"
+```
+
+The table was not partitioned in earlier versions of this project. There is no
+migration tool here, so on an existing database the server logs a warning and
+leaves retention disabled; recreating the volume with `docker compose down -v`
+enables it.
+
 ## Known trade-offs
 
 These are deliberate for a project this size, and are the first things I would
@@ -142,4 +167,8 @@ change for a real deployment:
   shape later.
 - **No generated types.** Response types are hand-written; a schema-driven
   codegen step would keep them honest.
-- **Telemetry grows forever.** No retention policy or downsampling.
+- **No downsampling.** Raw readings are dropped once they age out (see
+  Retention above) rather than being rolled up into hourly or daily aggregates,
+  so charts cannot go back further than the retention window. A real deployment
+  would keep raw data briefly and aggregates for years, which is what
+  TimescaleDB's continuous aggregates exist to do.

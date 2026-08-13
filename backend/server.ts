@@ -23,6 +23,7 @@ import {
   type KeyValue,
   type MachineState,
 } from "./lib/telemetry.js";
+import { upcomingPartitions, expiredPartitions } from "./lib/partitions.js";
 
 interface AuthUser {
   userId: string;
@@ -33,11 +34,12 @@ interface GraphQLContext {
   user: AuthUser | null;
 }
 
+/** Shapes the API returns, with timestamps already serialised. */
 interface Alert {
   id: string;
   severity: "INFO" | "WARNING" | "CRITICAL";
   message: string;
-  timestamp: Date;
+  timestamp: string;
   acknowledged: boolean;
 }
 
@@ -47,11 +49,18 @@ interface Machine {
   status: MachineState;
   temperature: number | null;
   rpm: number | null;
-  lastSeen: Date;
+  lastSeen: string;
   alerts: Alert[];
 }
 
-/** Shape of a row coming back from MACHINE_SELECT. */
+/**
+ * Rows as the driver hands them back. Timestamps are Date objects when they
+ * come from a column and strings when they arrive inside json_agg output.
+ */
+interface AlertRow extends Omit<Alert, "timestamp"> {
+  timestamp: Date | string;
+}
+
 interface MachineRow {
   id: string;
   name: string;
@@ -59,7 +68,7 @@ interface MachineRow {
   temperature: number | null;
   rpm: number | null;
   last_seen: Date;
-  alerts: (Alert & { machine_id: string })[] | null;
+  alerts: AlertRow[] | null;
 }
 
 const logger = pino({
@@ -95,15 +104,18 @@ async function initDb(): Promise<void> {
     );
 
     CREATE TABLE IF NOT EXISTS telemetry (
-      id SERIAL PRIMARY KEY,
+      id BIGINT GENERATED ALWAYS AS IDENTITY,
       machine_id TEXT NOT NULL REFERENCES machines(id),
       timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      values JSONB NOT NULL
-    );
+      values JSONB NOT NULL,
+      PRIMARY KEY (id, timestamp)
+    ) PARTITION BY RANGE (timestamp);
 
     CREATE INDEX IF NOT EXISTS telemetry_machine_time_idx
       ON telemetry (machine_id, timestamp DESC);
   `);
+
+  await runTelemetryMaintenance();
 
   const { rowCount } = await pool.query("SELECT 1 FROM machines LIMIT 1");
   if (rowCount === 0) {
@@ -114,6 +126,69 @@ async function initDb(): Promise<void> {
       );
     }
     logger.info("Seeded initial machines");
+  }
+}
+
+/**
+ * Raw readings are kept for this many days and then dropped a whole partition
+ * at a time. Anything longer term would want downsampled rollups rather than
+ * every reading, which this project does not do yet.
+ */
+const RETENTION_DAYS = parseInt(process.env.TELEMETRY_RETENTION_DAYS ?? "30", 10);
+const PARTITION_DAYS_AHEAD = 3;
+const MAINTENANCE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * A database created before telemetry was partitioned still has a plain table,
+ * and there is no migration tool here to convert it. Retention is skipped
+ * rather than crashing the server on boot.
+ */
+async function isTelemetryPartitioned(): Promise<boolean> {
+  const { rows } = await pool.query<{ relkind: string }>(
+    "SELECT relkind FROM pg_class WHERE relname = 'telemetry'"
+  );
+  return rows[0]?.relkind === "p";
+}
+
+/** Creates the partitions the next few days need and drops expired ones. */
+async function runTelemetryMaintenance(now = new Date()): Promise<void> {
+  if (!(await isTelemetryPartitioned())) {
+    logger.warn(
+      "telemetry is not partitioned, so retention is disabled. Recreate the database volume to enable it."
+    );
+    return;
+  }
+
+  for (const { name, from, to } of upcomingPartitions(now, PARTITION_DAYS_AHEAD)) {
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS ${name}
+       PARTITION OF telemetry FOR VALUES FROM ('${from}') TO ('${to}')`
+    );
+  }
+
+  const { rows } = await pool.query<{ name: string }>(
+    `SELECT c.relname AS name
+     FROM pg_class c
+     JOIN pg_inherits i ON i.inhrelid = c.oid
+     JOIN pg_class parent ON parent.oid = i.inhparent
+     WHERE parent.relname = 'telemetry'`
+  );
+
+  const expired = expiredPartitions(
+    rows.map((r) => r.name),
+    now,
+    RETENTION_DAYS
+  );
+
+  for (const name of expired) {
+    await pool.query(`DROP TABLE IF EXISTS ${name}`);
+  }
+
+  if (expired.length > 0) {
+    logger.info(
+      { dropped: expired, retentionDays: RETENTION_DAYS },
+      "Dropped expired telemetry partitions"
+    );
   }
 }
 
@@ -177,6 +252,15 @@ function requireAuth(context: GraphQLContext): void {
 const pubsub = new PubSub();
 const MACHINE_EVENT = "MACHINE_EVENT";
 
+/**
+ * Timestamps are exposed as ISO strings. Handing a Date to a GraphQL String
+ * field coerces it through valueOf(), which yields epoch milliseconds that
+ * `new Date(...)` cannot parse back on the client.
+ */
+function toIsoString(value: Date | string): string {
+  return value instanceof Date ? value.toISOString() : value;
+}
+
 function dbRowToMachine(row: MachineRow): Machine {
   return {
     id: row.id,
@@ -184,12 +268,12 @@ function dbRowToMachine(row: MachineRow): Machine {
     status: row.status,
     temperature: row.temperature,
     rpm: row.rpm,
-    lastSeen: row.last_seen,
+    lastSeen: toIsoString(row.last_seen),
     alerts: (row.alerts ?? []).map((a) => ({
       id: a.id,
       severity: a.severity,
       message: a.message,
-      timestamp: a.timestamp,
+      timestamp: toIsoString(a.timestamp),
       acknowledged: a.acknowledged,
     })),
   };
@@ -400,7 +484,7 @@ const resolvers = {
 
       return rows.map((r) => ({
         machineId: r.machine_id,
-        timestamp: r.timestamp,
+        timestamp: toIsoString(r.timestamp),
         values: r.values,
       }));
     },
@@ -423,7 +507,7 @@ const resolvers = {
     ) => {
       requireAuth(context);
 
-      const { rows } = await pool.query<Alert>(
+      const { rows } = await pool.query<AlertRow>(
         `UPDATE alerts SET acknowledged=TRUE
          WHERE id=$1 AND machine_id=$2
          RETURNING id, severity, message, timestamp, acknowledged`,
@@ -437,7 +521,7 @@ const resolvers = {
         machineUpdated: await getMachine(machineId),
       });
 
-      return acknowledged;
+      return { ...acknowledged, timestamp: toIsoString(acknowledged.timestamp) };
     },
   },
 
@@ -563,6 +647,15 @@ app.use(
 
 await initDb();
 await initRabbit();
+
+// Partitions have to exist before the day they cover, so maintenance keeps
+// running for as long as the process does.
+const maintenanceTimer = setInterval(() => {
+  runTelemetryMaintenance().catch((err) =>
+    logger.error({ err }, "Telemetry maintenance failed")
+  );
+}, MAINTENANCE_INTERVAL_MS);
+maintenanceTimer.unref();
 
 const PORT = process.env.PORT ?? 4000;
 httpServer.listen(PORT, () => {
