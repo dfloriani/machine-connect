@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Test and tooling caches
+coverage/
+.vite/
+.eslintcache
+.npm
+
+# Environment files - the .example files are the ones that get committed
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editors and OS noise
+.idea/
+.vscode/
+.claude/
+CLAUDE.md
+.DS_Store
+*.swp
+*.swo
+*~
