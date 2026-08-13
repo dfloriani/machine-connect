@@ -1,0 +1,322 @@
+:root {
+  --bg: #0f172a;
+  --surface: #1e293b;
+  --surface-raised: #273449;
+  --border: #334155;
+  --text: #e2e8f0;
+  --text-muted: #94a3b8;
+  --accent: #38bdf8;
+  --radius: 8px;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.35rem 0.8rem;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Layout */
+
+.app {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+.app__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.app__header h1 {
+  font-size: 1.35rem;
+  margin: 0;
+}
+
+.app__main {
+  display: grid;
+  grid-template-columns: minmax(320px, 420px) 1fr;
+  gap: 1.5rem;
+  margin-top: 1.5rem;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .app__main {
+    grid-template-columns: 1fr;
+  }
+}
+
+.app__empty {
+  color: var(--text-muted);
+  padding: 2rem;
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
+
+/* Connection indicator */
+
+.connection-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+}
+
+.connection-status__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+/* Machine list */
+
+.machine-list-container {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.machine-list__count {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.machine-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  transition: opacity 0.2s ease;
+}
+
+/* Dim the list while a page is in flight instead of unmounting it. */
+.machine-list[data-loading="true"] {
+  opacity: 0.6;
+}
+
+.machine-list__pagination {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.machine-list__error {
+  color: #fca5a5;
+}
+
+/* Machine card */
+
+.machine-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid transparent;
+  border-radius: var(--radius);
+  padding: 0.9rem 1rem;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    transform 0.15s ease;
+}
+
+.machine-card:hover {
+  transform: translateY(-1px);
+}
+
+.machine-card--selected {
+  border-left-color: var(--accent);
+  background: var(--surface-raised);
+}
+
+.machine-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.machine-card__name {
+  font-size: 1rem;
+  margin: 0;
+}
+
+.machine-card__status-badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: #0b1120;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+}
+
+.machine-card__metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+}
+
+.metric__label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.metric__value {
+  font-variant-numeric: tabular-nums;
+  font-size: 1.05rem;
+}
+
+.metric--warn .metric__value {
+  color: #fbbf24;
+}
+
+.machine-card__alerts {
+  margin-top: 0.9rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.6rem;
+}
+
+.machine-card__alerts h3 {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin: 0 0 0.4rem;
+}
+
+.machine-card__alerts ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: var(--radius);
+  background: rgba(148, 163, 184, 0.1);
+  border-left: 3px solid var(--text-muted);
+}
+
+.alert--warning {
+  border-left-color: #f59e0b;
+}
+
+.alert--critical {
+  border-left-color: #ef4444;
+}
+
+.alert--info {
+  border-left-color: #3b82f6;
+}
+
+.alert button {
+  padding: 0.15rem 0.5rem;
+  font-size: 0.75rem;
+}
+
+/* Alert banner */
+
+.alert-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.alert-banner__item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius);
+  color: #0b1120;
+  font-size: 0.9rem;
+}
+
+.alert-banner__label {
+  font-weight: 700;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+}
+
+.alert-banner__machine {
+  font-weight: 600;
+}
+
+.alert-banner__message {
+  flex: 1;
+}
+
+.alert-banner__ack {
+  background: rgba(15, 23, 42, 0.2);
+  border-color: transparent;
+  color: #0b1120;
+}
+
+/* Telemetry chart */
+
+.telemetry-chart {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+}
+
+.telemetry-chart h2 {
+  font-size: 1rem;
+  margin: 0 0 1rem;
+}
