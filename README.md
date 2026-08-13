@@ -172,3 +172,7 @@ change for a real deployment:
   so charts cannot go back further than the retention window. A real deployment
   would keep raw data briefly and aggregates for years, which is what
   TimescaleDB's continuous aggregates exist to do.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
