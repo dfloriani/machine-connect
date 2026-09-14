@@ -41,7 +41,7 @@ A single backend test: `npx tsx --test tests/telemetry.test.ts`. A single fronte
 
 **Cache policies carry real weight.** `MachineStatus.alerts` has a `merge` that unions by id (Apollo would otherwise replace the array and drop alerts absent from a payload), and optimistic responses echo the existing alert rather than fabricating fields, because `Alert` is normalized by id and fabricated values leak to every view. Both live in [apolloClient.ts](frontend/src/apolloClient.ts) and [MachineCard.tsx](frontend/src/components/MachineCard.tsx).
 
-**Subscription fan-out is broadcast plus filter.** Every subscriber receives every event; the resolver filters by `machineId` in `resolve`. `PubSub` is in-memory, so multiple backend instances would not share events. Both are listed as known trade-offs in the README.
+**Subscription filtering happens before execution.** Every event goes to the one `MACHINE_EVENT` topic; `withFilter` calls `isMachineSubscribed` from [backend/lib/subscriptions.ts](backend/lib/subscriptions.ts) for each subscriber, so an event for a different machine is not executed or sent. `PubSub` is in-memory, so multiple backend instances would not share events.
 
 **WebSocket connection state reaches React through window events.** `WS_STATUS_EVENTS` in [apolloClient.ts](frontend/src/apolloClient.ts) is the single source for the event names; [ConnectionStatus.tsx](frontend/src/components/ConnectionStatus.tsx) subscribes to them.
 

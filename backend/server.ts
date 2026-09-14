@@ -2,7 +2,7 @@ import express, { type Request, type Response } from "express";
 import { ApolloServer } from "@apollo/server";
 import { expressMiddleware } from "@apollo/server/express4";
 import { makeExecutableSchema } from "@graphql-tools/schema";
-import { PubSub } from "graphql-subscriptions";
+import { PubSub, withFilter } from "graphql-subscriptions";
 import { createServer } from "http";
 import { WebSocketServer } from "ws";
 import { useServer } from "graphql-ws/lib/use/ws";
@@ -24,6 +24,7 @@ import {
   type MachineState,
 } from "./lib/telemetry.js";
 import { upcomingPartitions, expiredPartitions } from "./lib/partitions.js";
+import { isMachineSubscribed } from "./lib/subscriptions.js";
 
 interface AuthUser {
   userId: string;
@@ -527,20 +528,19 @@ const resolvers = {
 
   Subscription: {
     machineUpdated: {
-      subscribe: (_parent: unknown, _args: unknown, context: GraphQLContext) => {
-        if (!context.user) throw new Error("Unauthorized");
-        return pubsub.asyncIterator<{ machineUpdated: Machine }>([MACHINE_EVENT]);
-      },
-      // Every subscriber sees every event and the filtering happens here.
-      // With more machines this should move to withFilter so the server stops
-      // waking up subscriptions that are going to discard the payload.
-      resolve: (
-        payload: { machineUpdated: Machine },
-        { machineId }: { machineId?: string }
-      ) => {
-        if (!machineId) return payload.machineUpdated;
-        return payload.machineUpdated.id === machineId ? payload.machineUpdated : null;
-      },
+      // The filter runs before execution, so an event for a different machine
+      // is not executed and not sent. The field is non-null, so a resolve that
+      // returned null for that event would send the subscriber an error.
+      subscribe: withFilter(
+        (_parent: unknown, _args: unknown, context: GraphQLContext) => {
+          if (!context.user) throw new Error("Unauthorized");
+          return pubsub.asyncIterator<{ machineUpdated: Machine }>([MACHINE_EVENT]);
+        },
+        (
+          payload: { machineUpdated: Machine },
+          { machineId }: { machineId?: string | null }
+        ) => isMachineSubscribed(payload.machineUpdated.id, machineId)
+      ),
     },
   },
 };

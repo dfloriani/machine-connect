@@ -110,6 +110,13 @@ by the query and the subscription, so every source writes the same shape into
 the cache. When they drift, you get half-updated cards and refetches you did not
 ask for.
 
+**Filter subscription events before execution, not in `resolve`.**
+`machineUpdated` returns `MachineStatus!`, which cannot be null. If `resolve`
+returns `null` for an event from a different machine, GraphQL sends the
+subscriber an error, not an empty message. `withFilter` compares each event
+with the subscriber's `machineId` before execution. An event that does not
+match is not executed and not sent.
+
 **Merging alerts instead of replacing them.** Apollo replaces array fields by
 default, so an incoming payload without a given alert would silently drop it
 from a cached machine. The `alerts` field has a `merge` policy that unions by
@@ -159,9 +166,6 @@ change for a real deployment:
 - **Subscriptions are in-process.** `graphql-subscriptions`' `PubSub` is
   in-memory, so a second backend instance would not see the first's events.
   Horizontal scaling needs a Redis-backed pub/sub.
-- **Filtering happens after fan-out.** Every subscriber is woken for every
-  event and non-matching payloads resolve to `null`. `withFilter` would stop
-  that at the source.
 - **No migrations.** The schema is created on boot with `CREATE TABLE IF NOT
   EXISTS`, which is fine for a demo and not for anything that has to change
   shape later.
