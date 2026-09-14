@@ -17,6 +17,10 @@ coverage/
 .env.*
 !.env.example
 
+# Explanations for one reader. These files are not project documentation.
+docs/explanations/
+NOTES.md
+
 # Logs
 *.log
 npm-debug.log*
