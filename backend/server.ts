@@ -197,6 +197,14 @@ let rabbitChannel: amqplib.Channel | null = null;
 const TELEMETRY_QUEUE = "telemetry";
 
 /**
+ * How many unacknowledged readings the consumer holds at one time. It stays
+ * below the pool size (10 by default): each reading holds a pooled connection,
+ * also while it waits for its machine's row lock, and GraphQL queries need
+ * connections too.
+ */
+const CONSUMER_PREFETCH = 5;
+
+/**
  * Machines push readings far faster than the database wants to be written to,
  * so the HTTP endpoint only enqueues and this consumer does the real work.
  */
@@ -204,6 +212,7 @@ async function initRabbit(): Promise<void> {
   const conn = await amqplib.connect(process.env.RABBITMQ_URL as string);
   const channel = await conn.createChannel();
   await channel.assertQueue(TELEMETRY_QUEUE, { durable: true });
+  await channel.prefetch(CONSUMER_PREFETCH);
 
   await channel.consume(TELEMETRY_QUEUE, async (msg) => {
     if (!msg) return;
@@ -311,41 +320,59 @@ async function processTelemetry(machineId: string, values: unknown): Promise<Mac
   const kv = toKeyValueMap(readings);
   const newStatus = deriveStatus(kv);
   const now = new Date();
-  const prev = await getMachine(machineId);
 
-  if (!prev) throw new Error(`Unknown machine ${machineId}`);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
-  await pool.query(
-    `UPDATE machines
-     SET status=$1, temperature=COALESCE($2, temperature),
-         rpm=COALESCE($3, rpm), last_seen=$4
-     WHERE id=$5`,
-    [
-      newStatus,
-      kv.temperature ? parseFloat(kv.temperature) : null,
-      kv.rpm ? parseInt(kv.rpm, 10) : null,
-      now,
-      machineId,
-    ]
-  );
+    // A second reading for this machine waits here until this transaction
+    // ends, and then reads the status this one wrote.
+    const { rows } = await client.query<{ status: MachineState }>(
+      "SELECT status FROM machines WHERE id = $1 FOR UPDATE",
+      [machineId]
+    );
+    const prev = rows[0];
+    if (!prev) throw new Error(`Unknown machine ${machineId}`);
 
-  await pool.query(
-    "INSERT INTO telemetry (machine_id, timestamp, values) VALUES ($1, $2, $3)",
-    [machineId, now, JSON.stringify(readings)]
-  );
-
-  if (shouldRaiseAlert(prev.status, newStatus)) {
-    await pool.query(
-      `INSERT INTO alerts (id, machine_id, severity, message, timestamp)
-       VALUES ($1, $2, $3, $4, $5)`,
+    await client.query(
+      `UPDATE machines
+       SET status=$1, temperature=COALESCE($2, temperature),
+           rpm=COALESCE($3, rpm), last_seen=$4
+       WHERE id=$5`,
       [
-        `${machineId}-${Date.now()}`,
-        machineId,
-        "WARNING",
-        `Machine ${machineId} entered WARNING state`,
+        newStatus,
+        kv.temperature ? parseFloat(kv.temperature) : null,
+        kv.rpm ? parseInt(kv.rpm, 10) : null,
         now,
+        machineId,
       ]
     );
+
+    await client.query(
+      "INSERT INTO telemetry (machine_id, timestamp, values) VALUES ($1, $2, $3)",
+      [machineId, now, JSON.stringify(readings)]
+    );
+
+    if (shouldRaiseAlert(prev.status, newStatus)) {
+      await client.query(
+        `INSERT INTO alerts (id, machine_id, severity, message, timestamp)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          `${machineId}-${Date.now()}`,
+          machineId,
+          "WARNING",
+          `Machine ${machineId} entered WARNING state`,
+          now,
+        ]
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
   }
 
   const updated = (await getMachine(machineId)) as Machine;

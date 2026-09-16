@@ -33,7 +33,27 @@ A single backend test: `npx tsx --test tests/telemetry.test.ts`. A single fronte
 
 ## Architecture
 
-**Telemetry flow.** `POST /api/telemetry` validates and enqueues to the durable `telemetry` RabbitMQ queue, returning `202`; the consumer in the same process calls `processTelemetry()`. If the broker is unavailable the endpoint processes inline and returns `200` with `queued: false`. The `ingestTelemetry` mutation calls `processTelemetry()` directly. All paths converge on that one function in [backend/server.ts](backend/server.ts): validate, derive status, update `machines`, append to `telemetry`, raise an alert on the edge into WARNING, publish `MACHINE_EVENT`.
+**Telemetry flow.** Every reading goes through `processTelemetry()` in [backend/server.ts](backend/server.ts).
+
+Ways in:
+
+- `POST /api/telemetry` validates the reading, puts it on the durable `telemetry` RabbitMQ queue and returns `202`. The consumer in the same process calls `processTelemetry()`.
+- If the broker is unavailable, the endpoint calls `processTelemetry()` inline and returns `200` with `queued: false`.
+- The `ingestTelemetry` mutation calls `processTelemetry()` directly.
+
+Steps in `processTelemetry()`:
+
+1. Validate the values and derive the status.
+2. Start a transaction and lock the machine row with `SELECT … FOR UPDATE`.
+3. Update `machines`.
+4. Append to `telemetry`.
+5. Raise a `WARNING` alert on the edge into WARNING.
+6. `COMMIT`, then publish `MACHINE_EVENT`.
+
+Rules to keep:
+
+- **One reading per machine at a time.** The row lock makes a second reading for the same machine wait, so the edge rule sees the status the previous reading wrote. Put new writes on the transaction's `client`, not on `pool.query`, which uses a different connection outside the transaction (DECISIONS.md, entry 1).
+- **Consumer limit.** The consumer holds at most `CONSUMER_PREFETCH` (5) unacknowledged messages. Keep it below the `pg` pool size of 10 (DECISIONS.md, entry 2).
 
 **Pure logic is extracted for testing.** [backend/lib/telemetry.ts](backend/lib/telemetry.ts) holds `validateTelemetryValues`, `deriveStatus`, `shouldRaiseAlert`, `toKeyValueMap` and the threshold/limit constants, so [backend/tests/telemetry.test.ts](backend/tests/telemetry.test.ts) runs with no database or broker. Keep new business rules there rather than inline in resolvers.
 
