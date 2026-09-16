@@ -5,7 +5,8 @@ import {
   partitionName,
   partitionDate,
   partitionSpec,
-  upcomingPartitions,
+  partitionsToCreate,
+  isInPartitionRange,
   expiredPartitions,
 } from "../lib/partitions.js";
 
@@ -35,18 +36,51 @@ test("partitionDate ignores tables that are not partitions", () => {
   assert.equal(partitionDate("telemetry_not_a_date"), null);
 });
 
-test("upcomingPartitions covers today plus the requested days ahead", () => {
-  const specs = upcomingPartitions(new Date("2026-08-13T12:00:00.000Z"), 3);
+test("partitionsToCreate covers the retention window plus the requested days ahead", () => {
+  const specs = partitionsToCreate(new Date("2026-08-13T12:00:00.000Z"), 2, 3);
 
   assert.deepEqual(
     specs.map((s) => s.name),
     [
+      "telemetry_2026_08_11",
+      "telemetry_2026_08_12",
       "telemetry_2026_08_13",
       "telemetry_2026_08_14",
       "telemetry_2026_08_15",
       "telemetry_2026_08_16",
     ]
   );
+});
+
+test("partitionsToCreate keeps every partition that expiredPartitions keeps", () => {
+  const now = new Date("2026-08-13T12:00:00.000Z");
+  const names = partitionsToCreate(now, 30, 3).map((s) => s.name);
+  assert.deepEqual(expiredPartitions(names, now, 30), []);
+});
+
+test("isInPartitionRange accepts times from the retention cutoff", () => {
+  const now = new Date("2026-08-13T12:00:00.000Z");
+  assert.equal(isInPartitionRange(new Date("2026-08-11T00:00:00.000Z"), now, 2, 3), true);
+  assert.equal(isInPartitionRange(new Date("2026-08-10T23:59:59.999Z"), now, 2, 3), false);
+});
+
+test("isInPartitionRange stops one day before the newest partition", () => {
+  const now = new Date("2026-08-13T12:00:00.000Z");
+  assert.equal(isInPartitionRange(new Date("2026-08-15T23:59:59.999Z"), now, 2, 3), true);
+  assert.equal(isInPartitionRange(new Date("2026-08-16T00:00:00.000Z"), now, 2, 3), false);
+});
+
+test("isInPartitionRange only accepts days that the previous day's maintenance created", () => {
+  const lastRun = new Date("2026-08-12T23:00:00.000Z");
+  const now = new Date("2026-08-13T00:30:00.000Z");
+  const created = new Set(partitionsToCreate(lastRun, 2, 3).map((s) => s.name));
+
+  for (let hour = 0; hour < 24 * 7; hour++) {
+    const recordedAt = new Date(Date.UTC(2026, 7, 9, hour));
+    if (isInPartitionRange(recordedAt, now, 2, 3)) {
+      assert.ok(created.has(partitionSpec(recordedAt).name), recordedAt.toISOString());
+    }
+  }
 });
 
 test("expiredPartitions drops only days past the retention window", () => {

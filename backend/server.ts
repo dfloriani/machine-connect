@@ -4,6 +4,7 @@ import { expressMiddleware } from "@apollo/server/express4";
 import { makeExecutableSchema } from "@graphql-tools/schema";
 import { PubSub, withFilter } from "graphql-subscriptions";
 import { createServer } from "http";
+import { randomUUID } from "crypto";
 import { WebSocketServer } from "ws";
 import { useServer } from "graphql-ws/lib/use/ws";
 import cors from "cors";
@@ -20,10 +21,24 @@ import {
   toKeyValueMap,
   deriveStatus,
   shouldRaiseAlert,
+  parseRecordedAt,
+  shouldApplyReading,
+  isClockAhead,
+  isTemporaryAnomaly,
+  temporaryAnomalyAction,
+  peakReadings,
+  isPeakRaised,
+  temporaryAnomalyMessage,
   type KeyValue,
+  type Neighbour,
   type MachineState,
 } from "./lib/telemetry.js";
-import { upcomingPartitions, expiredPartitions } from "./lib/partitions.js";
+import {
+  partitionsToCreate,
+  isInPartitionRange,
+  expiredPartitions,
+  retentionCutoff,
+} from "./lib/partitions.js";
 import { isMachineSubscribed } from "./lib/subscriptions.js";
 
 interface AuthUser {
@@ -92,7 +107,10 @@ async function initDb(): Promise<void> {
       status TEXT NOT NULL DEFAULT 'IDLE',
       temperature FLOAT,
       rpm INT,
-      last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      -- Server time of the last reading received, whether it was applied or not.
+      last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      -- Machine time of the newest reading applied to this row.
+      last_recorded_at TIMESTAMPTZ
     );
 
     CREATE TABLE IF NOT EXISTS alerts (
@@ -100,20 +118,53 @@ async function initDb(): Promise<void> {
       machine_id TEXT NOT NULL REFERENCES machines(id),
       severity TEXT NOT NULL,
       message TEXT NOT NULL,
+      -- Machine time of the reading that raised the alert, or of the first hot
+      -- reading of a temporary anomaly.
       timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      acknowledged BOOLEAN NOT NULL DEFAULT FALSE
+      -- Temporary anomaly only: machine time of the last hot reading.
+      last_hot_at TIMESTAMPTZ,
+      -- Temporary anomaly only: machine time of the first stored reading after
+      -- last_hot_at that is not hot.
+      later_reading_at TIMESTAMPTZ,
+      -- Temporary anomaly only: the highest temperature and rpm of the period.
+      readings JSONB,
+      acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
+      -- No two alerts start at the same reading, so a reading that is
+      -- processed twice cannot write a second row.
+      UNIQUE (machine_id, timestamp)
     );
 
+    -- recorded_at comes from the machine's clock, received_at from the server's.
+    -- Partitions follow recorded_at, so a unique key on (machine_id, recorded_at)
+    -- is allowed and a reading that arrives twice is stored once. A reading
+    -- whose recorded_at has no partition goes to out_of_range_readings.
+    -- The unique key's index also serves the newest-first query per machine.
     CREATE TABLE IF NOT EXISTS telemetry (
       id BIGINT GENERATED ALWAYS AS IDENTITY,
       machine_id TEXT NOT NULL REFERENCES machines(id),
-      timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      recorded_at TIMESTAMPTZ NOT NULL,
+      received_at TIMESTAMPTZ NOT NULL,
+      -- deriveStatus() at insert time, so neighbour queries can find hot readings.
+      status TEXT NOT NULL,
       values JSONB NOT NULL,
-      PRIMARY KEY (id, timestamp)
-    ) PARTITION BY RANGE (timestamp);
+      PRIMARY KEY (id, recorded_at),
+      UNIQUE (machine_id, recorded_at)
+    ) PARTITION BY RANGE (recorded_at);
 
-    CREATE INDEX IF NOT EXISTS telemetry_machine_time_idx
-      ON telemetry (machine_id, timestamp DESC);
+    -- Readings from a machine clock too far in the past or the future. They
+    -- are kept so the clock error can be measured, and the chart does not
+    -- read them. Retention deletes them by received_at.
+    CREATE TABLE IF NOT EXISTS out_of_range_readings (
+      machine_id TEXT NOT NULL REFERENCES machines(id),
+      recorded_at TIMESTAMPTZ NOT NULL,
+      received_at TIMESTAMPTZ NOT NULL,
+      status TEXT NOT NULL,
+      values JSONB NOT NULL,
+      PRIMARY KEY (machine_id, recorded_at)
+    );
+
+    CREATE INDEX IF NOT EXISTS out_of_range_readings_received_at_idx
+      ON out_of_range_readings (received_at);
   `);
 
   await runTelemetryMaintenance();
@@ -151,8 +202,16 @@ async function isTelemetryPartitioned(): Promise<boolean> {
   return rows[0]?.relkind === "p";
 }
 
-/** Creates the partitions the next few days need and drops expired ones. */
+/**
+ * Creates the partitions from the retention cutoff to a few days ahead, drops
+ * expired ones, and deletes expired out-of-range readings.
+ */
 async function runTelemetryMaintenance(now = new Date()): Promise<void> {
+  // A small table without partitions, so a DELETE is enough here.
+  await pool.query("DELETE FROM out_of_range_readings WHERE received_at < $1", [
+    retentionCutoff(now, RETENTION_DAYS),
+  ]);
+
   if (!(await isTelemetryPartitioned())) {
     logger.warn(
       "telemetry is not partitioned, so retention is disabled. Recreate the database volume to enable it."
@@ -160,7 +219,11 @@ async function runTelemetryMaintenance(now = new Date()): Promise<void> {
     return;
   }
 
-  for (const { name, from, to } of upcomingPartitions(now, PARTITION_DAYS_AHEAD)) {
+  for (const { name, from, to } of partitionsToCreate(
+    now,
+    RETENTION_DAYS,
+    PARTITION_DAYS_AHEAD
+  )) {
     await pool.query(
       `CREATE TABLE IF NOT EXISTS ${name}
        PARTITION OF telemetry FOR VALUES FROM ('${from}') TO ('${to}')`
@@ -217,8 +280,10 @@ async function initRabbit(): Promise<void> {
   await channel.consume(TELEMETRY_QUEUE, async (msg) => {
     if (!msg) return;
     try {
-      const { machineId, values } = JSON.parse(msg.content.toString());
-      await processTelemetry(machineId, values);
+      const { machineId, recordedAt, receivedAt, values } = JSON.parse(
+        msg.content.toString()
+      );
+      await processTelemetry(machineId, recordedAt, new Date(receivedAt), values);
       channel.ack(msg);
     } catch (err) {
       logger.error({ err }, "Failed to process telemetry message");
@@ -271,6 +336,16 @@ function toIsoString(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : value;
 }
 
+function dbRowToAlert(row: AlertRow): Alert {
+  return {
+    id: row.id,
+    severity: row.severity,
+    message: row.message,
+    timestamp: toIsoString(row.timestamp),
+    acknowledged: row.acknowledged,
+  };
+}
+
 function dbRowToMachine(row: MachineRow): Machine {
   return {
     id: row.id,
@@ -279,13 +354,7 @@ function dbRowToMachine(row: MachineRow): Machine {
     temperature: row.temperature,
     rpm: row.rpm,
     lastSeen: toIsoString(row.last_seen),
-    alerts: (row.alerts ?? []).map((a) => ({
-      id: a.id,
-      severity: a.severity,
-      message: a.message,
-      timestamp: toIsoString(a.timestamp),
-      acknowledged: a.acknowledged,
-    })),
+    alerts: (row.alerts ?? []).map(dbRowToAlert),
   };
 }
 
@@ -310,16 +379,199 @@ async function getMachine(id: string): Promise<Machine | null> {
   return row ? dbRowToMachine(row) : null;
 }
 
+interface StoredNeighbour extends Neighbour {
+  recordedAt: Date;
+}
+
+/**
+ * The stored reading of a machine just before or just after a time, and the
+ * temporary anomaly alert whose period covers it.
+ */
+async function findNeighbour(
+  client: pg.PoolClient,
+  machineId: string,
+  recordedAt: Date,
+  direction: "before" | "after"
+): Promise<StoredNeighbour | null> {
+  const [compare, order] = direction === "before" ? ["<", "DESC"] : [">", "ASC"];
+  const { rows } = await client.query<{
+    recorded_at: Date;
+    status: MachineState;
+    alert_id: string | null;
+  }>(
+    `SELECT t.recorded_at, t.status, a.id AS alert_id
+     FROM (
+       SELECT recorded_at, status FROM telemetry
+       WHERE machine_id = $1 AND recorded_at ${compare} $2
+       ORDER BY recorded_at ${order}
+       LIMIT 1
+     ) t
+     LEFT JOIN alerts a
+       ON a.machine_id = $1
+      AND a.last_hot_at IS NOT NULL
+      AND t.recorded_at BETWEEN a.timestamp AND a.last_hot_at`,
+    [machineId, recordedAt]
+  );
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    recordedAt: row.recorded_at,
+    hot: row.status === "WARNING",
+    alertId: row.alert_id,
+  };
+}
+
+interface AnomalyRow {
+  id: string;
+  timestamp: Date;
+  last_hot_at: Date;
+  later_reading_at: Date;
+  readings: KeyValue[];
+}
+
+/**
+ * Adds a late hot reading to the temporary anomaly alert of its hot period, or
+ * starts one (DECISIONS.md, entry 4). The machine row lock keeps the stored
+ * readings next to it unchanged until this transaction ends.
+ */
+async function recordTemporaryAnomaly(
+  client: pg.PoolClient,
+  machineId: string,
+  takenAt: Date,
+  readings: KeyValue[]
+): Promise<void> {
+  const previous = await findNeighbour(client, machineId, takenAt, "before");
+  const next = await findNeighbour(client, machineId, takenAt, "after");
+  const action = temporaryAnomalyAction(previous, next);
+
+  if (action.type === "none") return;
+
+  if (action.type === "insert") {
+    // A newer reading was applied, so a next neighbour is always stored.
+    const laterReadingAt = (next as StoredNeighbour).recordedAt;
+    const peaks = peakReadings([], readings);
+    await client.query(
+      `INSERT INTO alerts
+         (id, machine_id, severity, message, timestamp, last_hot_at, later_reading_at, readings)
+       VALUES ($1, $2, 'INFO', $3, $4, $4, $5, $6)
+       ON CONFLICT (machine_id, timestamp) DO NOTHING`,
+      [
+        `${machineId}-${randomUUID()}`,
+        machineId,
+        temporaryAnomalyMessage(machineId, takenAt, takenAt, peaks, laterReadingAt),
+        takenAt,
+        laterReadingAt,
+        JSON.stringify(peaks),
+      ]
+    );
+    return;
+  }
+
+  if (action.type === "extendEnd" && action.otherAlertId) {
+    logger.error(
+      {
+        machineId,
+        recordedAt: takenAt,
+        alertId: action.alertId,
+        otherAlertId: action.otherAlertId,
+      },
+      "Late hot reading is next to two temporary anomaly alerts; extending the earlier one"
+    );
+  }
+
+  const { rows } = await client.query<AnomalyRow>(
+    "SELECT id, timestamp, last_hot_at, later_reading_at, readings FROM alerts WHERE id = $1",
+    [action.alertId]
+  );
+  const current = rows[0];
+  if (!current) throw new Error(`Alert ${action.alertId} not found`);
+  const startedAt = takenAt < current.timestamp ? takenAt : current.timestamp;
+  const lastHotAt = takenAt > current.last_hot_at ? takenAt : current.last_hot_at;
+  const peaks = peakReadings(current.readings, readings);
+
+  // A period that only gets longer stays acknowledged. A higher peak is new
+  // information, so the alert asks for attention again.
+  await client.query(
+    `UPDATE alerts
+     SET timestamp = $2, last_hot_at = $3, readings = $4, message = $5,
+         acknowledged = acknowledged AND NOT $6
+     WHERE id = $1`,
+    [
+      current.id,
+      startedAt,
+      lastHotAt,
+      JSON.stringify(peaks),
+      temporaryAnomalyMessage(
+        machineId,
+        startedAt,
+        lastHotAt,
+        peaks,
+        current.later_reading_at
+      ),
+      isPeakRaised(current.readings, peaks),
+    ]
+  );
+}
+
+/**
+ * A late reading that is not hot, between a temporary anomaly's last hot
+ * reading and its "over by" time, shows that the anomaly ended earlier.
+ */
+async function endTemporaryAnomalyEarlier(
+  client: pg.PoolClient,
+  machineId: string,
+  takenAt: Date
+): Promise<void> {
+  const { rows } = await client.query<AnomalyRow>(
+    `SELECT id, timestamp, last_hot_at, later_reading_at, readings FROM alerts
+     WHERE machine_id = $1 AND last_hot_at < $2 AND later_reading_at > $2`,
+    [machineId, takenAt]
+  );
+  for (const row of rows) {
+    await client.query(
+      "UPDATE alerts SET later_reading_at = $2, message = $3 WHERE id = $1",
+      [
+        row.id,
+        takenAt,
+        temporaryAnomalyMessage(
+          machineId,
+          row.timestamp,
+          row.last_hot_at,
+          row.readings,
+          takenAt
+        ),
+      ]
+    );
+  }
+}
+
 /**
  * The single path every reading goes through, whether it arrived from the
  * queue or straight from the ingestTelemetry mutation.
  */
-async function processTelemetry(machineId: string, values: unknown): Promise<Machine> {
+async function processTelemetry(
+  machineId: string,
+  recordedAt: unknown,
+  receivedAt: Date,
+  values: unknown
+): Promise<Machine> {
   const readings: KeyValue[] = validateTelemetryValues(values);
+  const takenAt = parseRecordedAt(recordedAt);
+  if (isNaN(receivedAt.getTime())) throw new Error("receivedAt is not a valid time");
 
   const kv = toKeyValueMap(readings);
   const newStatus = deriveStatus(kv);
-  const now = new Date();
+  const clockAhead = isClockAhead(takenAt, receivedAt);
+  // Compared with the time of processing, not receivedAt: maintenance creates
+  // partitions by the time it runs, and a reading can wait in the queue.
+  const inRange = isInPartitionRange(
+    takenAt,
+    new Date(),
+    RETENTION_DAYS,
+    PARTITION_DAYS_AHEAD
+  );
+  let applied = false;
+  let stored = false;
 
   const client = await pool.connect();
   try {
@@ -327,44 +579,80 @@ async function processTelemetry(machineId: string, values: unknown): Promise<Mac
 
     // A second reading for this machine waits here until this transaction
     // ends, and then reads the status this one wrote.
-    const { rows } = await client.query<{ status: MachineState }>(
-      "SELECT status FROM machines WHERE id = $1 FOR UPDATE",
-      [machineId]
-    );
+    const { rows } = await client.query<{
+      status: MachineState;
+      last_recorded_at: Date | null;
+    }>("SELECT status, last_recorded_at FROM machines WHERE id = $1 FOR UPDATE", [
+      machineId,
+    ]);
     const prev = rows[0];
     if (!prev) throw new Error(`Unknown machine ${machineId}`);
 
-    await client.query(
-      `UPDATE machines
-       SET status=$1, temperature=COALESCE($2, temperature),
-           rpm=COALESCE($3, rpm), last_seen=$4
-       WHERE id=$5`,
-      [
-        newStatus,
-        kv.temperature ? parseFloat(kv.temperature) : null,
-        kv.rpm ? parseInt(kv.rpm, 10) : null,
-        now,
-        machineId,
-      ]
+    // (machine_id, recorded_at) identifies a reading. A reading that is
+    // already stored, for example a message RabbitMQ delivers again or a POST
+    // the machine sends again, inserts nothing and changes nothing else.
+    const { rowCount } = await client.query(
+      `INSERT INTO ${inRange ? "telemetry" : "out_of_range_readings"}
+         (machine_id, recorded_at, received_at, status, values)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (machine_id, recorded_at) DO NOTHING`,
+      [machineId, takenAt, receivedAt, newStatus, JSON.stringify(readings)]
     );
+    stored = rowCount === 1;
 
-    await client.query(
-      "INSERT INTO telemetry (machine_id, timestamp, values) VALUES ($1, $2, $3)",
-      [machineId, now, JSON.stringify(readings)]
-    );
+    if (stored) {
+      applied = inRange && shouldApplyReading(prev.last_recorded_at, takenAt, receivedAt);
 
-    if (shouldRaiseAlert(prev.status, newStatus)) {
-      await client.query(
-        `INSERT INTO alerts (id, machine_id, severity, message, timestamp)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [
-          `${machineId}-${Date.now()}`,
-          machineId,
-          "WARNING",
-          `Machine ${machineId} entered WARNING state`,
-          now,
-        ]
-      );
+      if (applied) {
+        await client.query(
+          `UPDATE machines
+           SET status=$1, temperature=COALESCE($2, temperature),
+               rpm=COALESCE($3, rpm), last_recorded_at=$4,
+               last_seen=GREATEST(last_seen, $5)
+           WHERE id=$6`,
+          [
+            newStatus,
+            kv.temperature ? parseFloat(kv.temperature) : null,
+            kv.rpm ? parseInt(kv.rpm, 10) : null,
+            takenAt,
+            receivedAt,
+            machineId,
+          ]
+        );
+      } else {
+        await client.query(
+          "UPDATE machines SET last_seen=GREATEST(last_seen, $1) WHERE id=$2",
+          [receivedAt, machineId]
+        );
+      }
+
+      if (applied && shouldRaiseAlert(prev.status, newStatus)) {
+        await client.query(
+          `INSERT INTO alerts (id, machine_id, severity, message, timestamp)
+           VALUES ($1, $2, 'WARNING', $3, $4)
+           ON CONFLICT (machine_id, timestamp) DO NOTHING`,
+          [
+            `${machineId}-${randomUUID()}`,
+            machineId,
+            `Machine ${machineId} entered WARNING state`,
+            takenAt,
+          ]
+        );
+      } else if (
+        // Not applied, inside the partition range and not from a clock that is
+        // ahead: a newer reading was already applied, so this one describes
+        // the past.
+        !applied &&
+        inRange &&
+        !clockAhead &&
+        prev.last_recorded_at !== null
+      ) {
+        if (isTemporaryAnomaly(newStatus, prev.status)) {
+          await recordTemporaryAnomaly(client, machineId, takenAt, readings);
+        } else if (newStatus !== "WARNING") {
+          await endTemporaryAnomalyEarlier(client, machineId, takenAt);
+        }
+      }
     }
 
     await client.query("COMMIT");
@@ -375,9 +663,26 @@ async function processTelemetry(machineId: string, values: unknown): Promise<Mac
     client.release();
   }
 
+  if (!stored) {
+    logger.info({ machineId, recordedAt: takenAt }, "Reading already stored, ignored");
+    return (await getMachine(machineId)) as Machine;
+  }
+  if (!inRange) {
+    logger.warn(
+      { machineId, recordedAt: takenAt, receivedAt },
+      "Reading stored in out_of_range_readings: no telemetry partition covers its time"
+    );
+  }
+  if (clockAhead) {
+    logger.warn(
+      { machineId, recordedAt: takenAt, receivedAt },
+      "Reading not applied: the machine clock is ahead of the server clock"
+    );
+  }
+
   const updated = (await getMachine(machineId)) as Machine;
   await pubsub.publish(MACHINE_EVENT, { machineUpdated: updated });
-  logger.info({ machineId, newStatus }, "Telemetry processed");
+  logger.info({ machineId, newStatus, applied }, "Telemetry processed");
   return updated;
 }
 
@@ -404,6 +709,7 @@ const typeDefs = `#graphql
     id: ID!
     severity: AlertSeverity!
     message: String!
+    "Machine time of the reading that raised the alert."
     timestamp: String!
     acknowledged: Boolean!
   }
@@ -416,6 +722,7 @@ const typeDefs = `#graphql
 
   type TelemetryPayload {
     machineId: ID!
+    "The time the machine took the reading, by the machine's clock."
     timestamp: String!
     values: [KeyValue!]!
   }
@@ -442,7 +749,15 @@ const typeDefs = `#graphql
   }
 
   type Mutation {
-    ingestTelemetry(machineId: ID!, values: [KeyValueInput!]!): MachineStatus!
+    """
+    recordedAt is the time the machine took the reading: ISO 8601 with a UTC
+    offset, for example 2026-09-16T13:47:20.375Z.
+    """
+    ingestTelemetry(
+      machineId: ID!
+      recordedAt: String!
+      values: [KeyValueInput!]!
+    ): MachineStatus!
     acknowledgeAlert(machineId: ID!, alertId: ID!): Alert!
   }
 
@@ -500,19 +815,19 @@ const resolvers = {
 
       const { rows } = await pool.query<{
         machine_id: string;
-        timestamp: Date;
+        recorded_at: Date;
         values: KeyValue[];
       }>(
-        `SELECT machine_id, timestamp, values FROM telemetry
+        `SELECT machine_id, recorded_at, values FROM telemetry
          WHERE machine_id=$1
-         ORDER BY timestamp DESC
+         ORDER BY recorded_at DESC
          LIMIT $2`,
         [machineId, limit]
       );
 
       return rows.map((r) => ({
         machineId: r.machine_id,
-        timestamp: toIsoString(r.timestamp),
+        timestamp: toIsoString(r.recorded_at),
         values: r.values,
       }));
     },
@@ -521,11 +836,15 @@ const resolvers = {
   Mutation: {
     ingestTelemetry: async (
       _parent: unknown,
-      { machineId, values }: { machineId: string; values: KeyValue[] },
+      {
+        machineId,
+        recordedAt,
+        values,
+      }: { machineId: string; recordedAt: string; values: KeyValue[] },
       context: GraphQLContext
     ) => {
       requireAuth(context);
-      return processTelemetry(machineId, values);
+      return processTelemetry(machineId, recordedAt, new Date(), values);
     },
 
     acknowledgeAlert: async (
@@ -549,7 +868,7 @@ const resolvers = {
         machineUpdated: await getMachine(machineId),
       });
 
-      return { ...acknowledged, timestamp: toIsoString(acknowledged.timestamp) };
+      return dbRowToAlert(acknowledged);
     },
   },
 
@@ -597,13 +916,17 @@ app.get("/health", (_req: Request, res: Response) => res.sendStatus(200));
 
 // REST ingestion endpoint for devices that speak plain HTTP rather than GraphQL.
 app.post("/api/telemetry", bodyParser.json(), async (req: Request, res: Response) => {
-  const { machineId, values } = req.body ?? {};
+  // The receive time is taken here, not in the consumer, so time spent in the
+  // queue is not counted as time the server had not yet heard the reading.
+  const receivedAt = new Date();
+  const { machineId, recordedAt, values } = req.body ?? {};
   if (!machineId || !Array.isArray(values)) {
     return res.status(400).json({ error: "Invalid payload" });
   }
 
   try {
     validateTelemetryValues(values);
+    parseRecordedAt(recordedAt);
   } catch (err) {
     return res.status(400).json({ error: (err as Error).message });
   }
@@ -613,14 +936,14 @@ app.post("/api/telemetry", bodyParser.json(), async (req: Request, res: Response
   if (rabbitChannel) {
     rabbitChannel.sendToQueue(
       TELEMETRY_QUEUE,
-      Buffer.from(JSON.stringify({ machineId, values })),
+      Buffer.from(JSON.stringify({ machineId, recordedAt, receivedAt, values })),
       { persistent: true }
     );
     return res.status(202).json({ ok: true, queued: true });
   }
 
   try {
-    await processTelemetry(machineId, values);
+    await processTelemetry(machineId, recordedAt, receivedAt, values);
     return res.json({ ok: true, queued: false });
   } catch (err) {
     logger.error({ err }, "Inline telemetry processing failed");

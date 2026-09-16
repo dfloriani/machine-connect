@@ -57,15 +57,42 @@ export function partitionSpec(date: Date): PartitionSpec {
   };
 }
 
+/** The start of the oldest UTC day that retention keeps. */
+export function retentionCutoff(now: Date, retentionDays: number): Date {
+  return addDays(startOfUtcDay(now), -retentionDays);
+}
+
 /**
- * Today plus a few days ahead, so an insert never arrives before its partition
- * exists even if the maintenance run is late or the clock drifts.
+ * Every day from the retention cutoff to a few days ahead. Partitions follow
+ * the machine's time, so a late reading needs the partition of a past day,
+ * which does not exist on a new database or after the server was stopped.
  */
-export function upcomingPartitions(now: Date, daysAhead: number): PartitionSpec[] {
-  const today = startOfUtcDay(now);
-  return Array.from({ length: daysAhead + 1 }, (_, offset) =>
-    partitionSpec(addDays(today, offset))
+export function partitionsToCreate(
+  now: Date,
+  retentionDays: number,
+  daysAhead: number
+): PartitionSpec[] {
+  const cutoff = retentionCutoff(now, retentionDays);
+  return Array.from({ length: retentionDays + daysAhead + 1 }, (_, offset) =>
+    partitionSpec(addDays(cutoff, offset))
   );
+}
+
+/**
+ * True when a reading's time has a partition. The upper bound is one day
+ * less than partitionsToCreate covers: maintenance runs every few hours, so
+ * when a new UTC day starts, the newest partition can still be missing until
+ * the next run.
+ */
+export function isInPartitionRange(
+  recordedAt: Date,
+  now: Date,
+  retentionDays: number,
+  daysAhead: number
+): boolean {
+  const from = retentionCutoff(now, retentionDays);
+  const to = addDays(startOfUtcDay(now), daysAhead);
+  return recordedAt.getTime() >= from.getTime() && recordedAt.getTime() < to.getTime();
 }
 
 /**
@@ -77,7 +104,7 @@ export function expiredPartitions(
   now: Date,
   retentionDays: number
 ): string[] {
-  const cutoff = addDays(startOfUtcDay(now), -retentionDays);
+  const cutoff = retentionCutoff(now, retentionDays);
 
   return names.filter((name) => {
     const day = partitionDate(name);

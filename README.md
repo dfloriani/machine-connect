@@ -53,8 +53,15 @@ Send a reading over the REST webhook (this is what a machine would do):
 ```bash
 curl -X POST http://localhost:4000/api/telemetry \
   -H "Content-Type: application/json" \
-  -d '{"machineId":"M-001","values":[{"key":"temperature","value":"95"},{"key":"rpm","value":"5200"}]}'
+  -d '{"machineId":"M-001","recordedAt":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","values":[{"key":"temperature","value":"95"},{"key":"rpm","value":"5200"}]}'
 ```
+
+`recordedAt` is the time the machine took the reading, as ISO 8601 with a UTC
+offset. The server stores it next to its own receive time. A reading older
+than the newest one already applied goes into the history without changing the
+machine. Hot readings that arrive after the machine is normal again become one
+`INFO` alert for the hot period, whatever order they arrive in. The same machine
+and `recordedAt` sent a second time is ignored.
 
 Anything above 90 °C or 5000 rpm moves the machine into `WARNING` and raises an
 alert. Watch the dashboard update without a refresh, or subscribe from another
@@ -134,8 +141,13 @@ limit, and validates telemetry payloads before anything reaches the database.
 ## Retention
 
 Telemetry is the only table that grows without bound, so it is partitioned by
-UTC day and old partitions are dropped on a schedule. `TELEMETRY_RETENTION_DAYS`
-sets the window and defaults to 30.
+the UTC day the machine took each reading, and old partitions are dropped on a
+schedule. `TELEMETRY_RETENTION_DAYS` sets the window and defaults to 30.
+
+A reading whose time has no partition, because the machine's clock is wrong or
+the reading is older than the window, goes to `out_of_range_readings` instead.
+That table keeps both times, so the clock error can be measured, and its rows
+are deleted once the server received them more than the window ago.
 
 This applies to raw sensor samples only. Alerts are kept indefinitely, so the
 record of what went wrong on a machine outlives the readings that triggered it.
@@ -143,8 +155,8 @@ record of what went wrong on a machine outlives the readings that triggered it.
 Dropping a partition is a catalog operation, unlike a bulk `DELETE`, which would
 write as much WAL as the rows it removes and leave the space for vacuum to
 reclaim. Maintenance runs at startup and every six hours: it creates the
-partitions for the next few days, so an insert never arrives before its
-partition exists, and drops any whose day has fallen outside the window.
+partitions from the start of the window to a few days ahead, so a late reading
+also has a partition, and drops any whose day has fallen outside the window.
 Because partitions are dropped whole, up to one extra day is kept.
 
 ```bash
