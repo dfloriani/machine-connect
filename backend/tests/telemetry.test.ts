@@ -13,7 +13,6 @@ import {
   temporaryAnomalyAction,
   peakReadings,
   isPeakRaised,
-  temporaryAnomalyMessage,
   MAX_VALUES_PER_PAYLOAD,
   MAX_CLOCK_AHEAD_MS,
 } from "../lib/telemetry.js";
@@ -224,34 +223,5 @@ test("isPeakRaised is true only when a peak value goes up", () => {
       { key: "rpm", value: "6000" },
     ]),
     true
-  );
-});
-
-test("temporaryAnomalyMessage describes one reading or a period", () => {
-  const peaks = [
-    { key: "temperature", value: "97" },
-    { key: "rpm", value: "3000" },
-  ];
-  assert.equal(
-    temporaryAnomalyMessage(
-      "M-001",
-      at("2026-09-16T12:00:01Z"),
-      at("2026-09-16T12:00:01Z"),
-      peaks,
-      at("2026-09-16T12:00:02Z")
-    ),
-    "Machine M-001 was temporarily in WARNING at 2026-09-16T12:00:01.000Z " +
-      "(temperature 97, rpm 3000), over by 2026-09-16T12:00:02.000Z"
-  );
-  assert.equal(
-    temporaryAnomalyMessage(
-      "M-001",
-      at("2026-09-16T12:00:01Z"),
-      at("2026-09-16T12:00:10Z"),
-      [],
-      at("2026-09-16T12:00:11Z")
-    ),
-    "Machine M-001 was temporarily in WARNING from 2026-09-16T12:00:01.000Z " +
-      "to 2026-09-16T12:00:10.000Z, over by 2026-09-16T12:00:11.000Z"
   );
 });

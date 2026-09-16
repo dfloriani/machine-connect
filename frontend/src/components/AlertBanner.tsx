@@ -1,5 +1,6 @@
 import { useMutation } from "@apollo/client";
 import { ACKNOWLEDGE_ALERT } from "../graphql/operations";
+import { alertText } from "../lib/alerts";
 import type { AlertSeverity, AlertWithMachine } from "../types";
 
 const SEVERITY_COLORS: Record<AlertSeverity, string> = {
@@ -23,7 +24,7 @@ export function AlertBanner({ alerts }: { alerts: AlertWithMachine[] }) {
         >
           <span className="alert-banner__label">{alert.severity}</span>
           <span className="alert-banner__machine">{alert.machineName}</span>
-          <span className="alert-banner__message">{alert.message}</span>
+          <span className="alert-banner__message">{alertText(alert)}</span>
           <button
             className="alert-banner__ack"
             onClick={() =>
@@ -33,9 +34,12 @@ export function AlertBanner({ alerts }: { alerts: AlertWithMachine[] }) {
                   acknowledgeAlert: {
                     __typename: "Alert",
                     id: alert.id,
+                    kind: alert.kind,
                     severity: alert.severity,
-                    message: alert.message,
                     timestamp: alert.timestamp,
+                    lastHotAt: alert.lastHotAt,
+                    laterReadingAt: alert.laterReadingAt,
+                    readings: alert.readings,
                     acknowledged: true,
                   },
                 },

@@ -10,9 +10,15 @@ import { gql } from "@apollo/client";
 export const ALERT_FRAGMENT = gql`
   fragment AlertFields on Alert {
     id
+    kind
     severity
-    message
     timestamp
+    lastHotAt
+    laterReadingAt
+    readings {
+      key
+      value
+    }
     acknowledged
   }
 `;

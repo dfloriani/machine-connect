@@ -139,8 +139,9 @@ the consumer in `initRabbit()`, `POST /api/telemetry` and `ingestTelemetry` in
 A late hot reading is a reading that gives `WARNING`, does not change the machine because a
 newer reading was applied first, and arrives while the machine is not in `WARNING`.
 
-All late hot readings from one hot period share one `INFO` alert. A hot period is a series of
-stored readings of one machine, in `recorded_at` order, that all give `WARNING`.
+All late hot readings from one hot period share one `INFO` alert of kind
+`TEMPORARY_ANOMALY`. A hot period is a series of stored readings of one machine, in
+`recorded_at` order, that all give `WARNING`.
 
 Example: a machine was hot at 10:00:01, 10:00:02, 10:00:03 and 10:00:04, and normal at
 10:00:05. The 10:00:05 reading arrives first and changes the machine. The four hot readings
@@ -194,6 +195,42 @@ that has already ended, so it is kept for reporting and must not fill the dashbo
   arrives last. The stored reading before it, 10:00:05, is hot and belongs to no alert, so
   10:00:06 also raises no alert.
 
-**Where:** `isTemporaryAnomaly`, `temporaryAnomalyAction`, `peakReadings`, `isPeakRaised` and
-`temporaryAnomalyMessage` in `backend/lib/telemetry.ts`; `recordTemporaryAnomaly()` and
-`endTemporaryAnomalyEarlier()` in `backend/server.ts`.
+**Where:** `isTemporaryAnomaly`, `temporaryAnomalyAction`, `peakReadings` and `isPeakRaised` in
+`backend/lib/telemetry.ts`; `recordTemporaryAnomaly()` and `endTemporaryAnomalyEarlier()` in
+`backend/server.ts`; `alertText()` in `frontend/src/lib/alerts.ts`.
+
+## 5. An alert carries a kind and times, and the frontend builds its text
+
+**Chosen:** The `alerts` table and the GraphQL `Alert` type have a `kind` (the `AlertKind`
+enum) and ISO times, and no `message`. `alertText()` in `frontend/src/lib/alerts.ts` builds
+the sentence for each kind and formats the times with `toLocaleTimeString()`.
+
+**Rejected:**
+
+- A `message` text built on the server. The server builds it once, when it inserts the
+  alert, and the times inside the text are formatted in the server's time zone, which is
+  UTC in the container. Every other time on the dashboard is formatted by the browser in
+  the viewer's time zone. The wording also cannot change without a backend change, and old
+  alerts keep the old wording.
+- Both `message` and `kind`. The two can disagree, and the client still has to choose which
+  one to show.
+- Choosing the sentence from `severity`. Each kind has one severity today, so `case "INFO":`
+  gives the same sentence, but a reader cannot see that `INFO` means a late hot reading, and
+  a change to the severity of an alert also changes its sentence.
+- Choosing the sentence by whether `laterReadingAt` is `null`. The meaning is in whether an
+  optional field is empty, and a later kind that also sets `laterReadingAt` breaks it.
+
+**Why:** Times are data, and only the browser knows the viewer's time zone. With a kind and
+times, the dashboard formats alert times the same way as "Last seen" and the chart. The two
+kinds have different fields: `TEMPORARY_ANOMALY` has `lastHotAt`, `laterReadingAt` and
+`readings`, and `ENTERED_WARNING` has none of them. `kind` names which of the two a row is.
+
+**What it costs:** A new alert kind needs a change in three places: the `AlertKind` enum in
+the schema, the `AlertKind` type in `frontend/src/types.ts`, and a case in `alertText()`.
+A client other than this dashboard receives no readable text and has to build its own. A
+database created before this change has a `message` column and no `kind` column, and
+needs `docker compose down -v`.
+
+**Where:** `initDb()`, the `Alert` type and `AlertKind` enum in `backend/server.ts`;
+`frontend/src/lib/alerts.ts`, `frontend/src/types.ts`, `AlertFields` in
+`frontend/src/graphql/operations.ts`.

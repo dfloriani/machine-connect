@@ -61,7 +61,8 @@ offset. The server stores it next to its own receive time. A reading older
 than the newest one already applied goes into the history without changing the
 machine. Hot readings that arrive after the machine is normal again become one
 `INFO` alert for the hot period, whatever order they arrive in. The same machine
-and `recordedAt` sent a second time is ignored.
+and `recordedAt` sent a second time is ignored. Alerts carry a kind and times, not
+text: the dashboard writes the sentence and shows the times in your local time zone.
 
 Anything above 90 °C or 5000 rpm moves the machine into `WARNING` and raises an
 alert. Watch the dashboard update without a refresh, or subscribe from another
@@ -74,7 +75,8 @@ subscription {
     status
     temperature
     alerts {
-      message
+      kind
+      timestamp
       acknowledged
     }
   }
@@ -129,10 +131,10 @@ default, so an incoming payload without a given alert would silently drop it
 from a cached machine. The `alerts` field has a `merge` policy that unions by
 id.
 
-**Optimistic responses should echo real data.** My first attempt returned a
-made-up `Alert` with an empty message. Since alerts are normalised by id, that
-briefly blanked the message everywhere it was displayed. Echoing the alert I
-already have and only flipping `acknowledged` fixes it.
+**Optimistic responses should echo real data.** `Alert` is normalised by id, so
+a made-up `Alert` in an optimistic response overwrites the cached alert
+everywhere it is displayed. The optimistic response for acknowledging an alert
+copies the cached alert and changes only `acknowledged`.
 
 **Guard the query surface, not just the resolvers.** A public GraphQL endpoint
 lets clients shape their own queries, so the server sets a depth limit, a rate

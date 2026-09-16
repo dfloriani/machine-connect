@@ -1,6 +1,7 @@
 import { memo } from "react";
 import { useMutation } from "@apollo/client";
 import { ACKNOWLEDGE_ALERT } from "../graphql/operations";
+import { alertText } from "../lib/alerts";
 import type { Alert, Machine, MachineState } from "../types";
 
 const STATUS_COLORS: Record<MachineState, string> = {
@@ -45,7 +46,7 @@ function AlertRow({
 }) {
   return (
     <li className={`alert alert--${alert.severity.toLowerCase()}`}>
-      <span>{alert.message}</span>
+      <span>{alertText(alert)}</span>
       <button
         onClick={(event) => {
           // The whole card is clickable, so stop the click selecting it too.
@@ -74,7 +75,7 @@ export const MachineCard = memo(function MachineCard({
    * Acknowledging is a local decision that the server will almost always
    * confirm, so the optimistic response flips the flag right away. It echoes
    * the alert I already have rather than inventing values, otherwise the
-   * normalised cache entry would briefly lose its message and severity.
+   * normalised cache entry would briefly lose its kind and severity.
    */
   const handleAcknowledge = (alert: Alert) =>
     acknowledgeAlert({

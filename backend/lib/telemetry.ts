@@ -220,26 +220,3 @@ export function isPeakRaised(before: KeyValue[], after: KeyValue[]): boolean {
     ({ key, value }) => old[key] === undefined || parseFloat(value) > parseFloat(old[key])
   );
 }
-
-/**
- * The alert text for a temporary anomaly: the hot period, its peak
- * temperature and rpm, and the time of the first reading after it that was
- * not hot. Times are ISO 8601 in UTC.
- */
-export function temporaryAnomalyMessage(
-  machineId: string,
-  startedAt: Date,
-  lastHotAt: Date,
-  peaks: KeyValue[],
-  laterReadingAt: Date
-): string {
-  const period =
-    startedAt.getTime() === lastHotAt.getTime()
-      ? `at ${startedAt.toISOString()}`
-      : `from ${startedAt.toISOString()} to ${lastHotAt.toISOString()}`;
-  const values = peaks.map(({ key, value }) => `${key} ${value}`).join(", ");
-  return (
-    `Machine ${machineId} was temporarily in WARNING ${period}` +
-    `${values ? ` (${values})` : ""}, over by ${laterReadingAt.toISOString()}`
-  );
-}

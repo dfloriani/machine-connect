@@ -28,7 +28,6 @@ import {
   temporaryAnomalyAction,
   peakReadings,
   isPeakRaised,
-  temporaryAnomalyMessage,
   type KeyValue,
   type Neighbour,
   type MachineState,
@@ -50,12 +49,21 @@ interface GraphQLContext {
   user: AuthUser | null;
 }
 
+/**
+ * What an alert is about. The API sends the kind and the times, and the
+ * dashboard builds the text, so every time is shown in the viewer's time zone.
+ */
+type AlertKind = "ENTERED_WARNING" | "TEMPORARY_ANOMALY";
+
 /** Shapes the API returns, with timestamps already serialised. */
 interface Alert {
   id: string;
+  kind: AlertKind;
   severity: "INFO" | "WARNING" | "CRITICAL";
-  message: string;
   timestamp: string;
+  lastHotAt: string | null;
+  laterReadingAt: string | null;
+  readings: KeyValue[] | null;
   acknowledged: boolean;
 }
 
@@ -73,8 +81,15 @@ interface Machine {
  * Rows as the driver hands them back. Timestamps are Date objects when they
  * come from a column and strings when they arrive inside json_agg output.
  */
-interface AlertRow extends Omit<Alert, "timestamp"> {
+interface AlertRow {
+  id: string;
+  kind: AlertKind;
+  severity: Alert["severity"];
   timestamp: Date | string;
+  last_hot_at: Date | string | null;
+  later_reading_at: Date | string | null;
+  readings: KeyValue[] | null;
+  acknowledged: boolean;
 }
 
 interface MachineRow {
@@ -116,17 +131,17 @@ async function initDb(): Promise<void> {
     CREATE TABLE IF NOT EXISTS alerts (
       id TEXT PRIMARY KEY,
       machine_id TEXT NOT NULL REFERENCES machines(id),
+      kind TEXT NOT NULL,
       severity TEXT NOT NULL,
-      message TEXT NOT NULL,
       -- Machine time of the reading that raised the alert, or of the first hot
       -- reading of a temporary anomaly.
       timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      -- Temporary anomaly only: machine time of the last hot reading.
+      -- TEMPORARY_ANOMALY only: machine time of the last hot reading.
       last_hot_at TIMESTAMPTZ,
-      -- Temporary anomaly only: machine time of the first stored reading after
+      -- TEMPORARY_ANOMALY only: machine time of the first stored reading after
       -- last_hot_at that is not hot.
       later_reading_at TIMESTAMPTZ,
-      -- Temporary anomaly only: the highest temperature and rpm of the period.
+      -- TEMPORARY_ANOMALY only: the highest temperature and rpm of the period.
       readings JSONB,
       acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
       -- No two alerts start at the same reading, so a reading that is
@@ -337,11 +352,16 @@ function toIsoString(value: Date | string): string {
 }
 
 function dbRowToAlert(row: AlertRow): Alert {
+  const optionalIso = (value: Date | string | null) =>
+    value === null ? null : toIsoString(value);
   return {
     id: row.id,
+    kind: row.kind,
     severity: row.severity,
-    message: row.message,
     timestamp: toIsoString(row.timestamp),
+    lastHotAt: optionalIso(row.last_hot_at),
+    laterReadingAt: optionalIso(row.later_reading_at),
+    readings: row.readings,
     acknowledged: row.acknowledged,
   };
 }
@@ -385,7 +405,7 @@ interface StoredNeighbour extends Neighbour {
 
 /**
  * The stored reading of a machine just before or just after a time, and the
- * temporary anomaly alert whose period covers it.
+ * TEMPORARY_ANOMALY alert whose period covers it.
  */
 async function findNeighbour(
   client: pg.PoolClient,
@@ -408,7 +428,7 @@ async function findNeighbour(
      ) t
      LEFT JOIN alerts a
        ON a.machine_id = $1
-      AND a.last_hot_at IS NOT NULL
+      AND a.kind = 'TEMPORARY_ANOMALY'
       AND t.recorded_at BETWEEN a.timestamp AND a.last_hot_at`,
     [machineId, recordedAt]
   );
@@ -425,7 +445,6 @@ interface AnomalyRow {
   id: string;
   timestamp: Date;
   last_hot_at: Date;
-  later_reading_at: Date;
   readings: KeyValue[];
 }
 
@@ -452,13 +471,12 @@ async function recordTemporaryAnomaly(
     const peaks = peakReadings([], readings);
     await client.query(
       `INSERT INTO alerts
-         (id, machine_id, severity, message, timestamp, last_hot_at, later_reading_at, readings)
-       VALUES ($1, $2, 'INFO', $3, $4, $4, $5, $6)
+         (id, machine_id, kind, severity, timestamp, last_hot_at, later_reading_at, readings)
+       VALUES ($1, $2, 'TEMPORARY_ANOMALY', 'INFO', $3, $3, $4, $5)
        ON CONFLICT (machine_id, timestamp) DO NOTHING`,
       [
         `${machineId}-${randomUUID()}`,
         machineId,
-        temporaryAnomalyMessage(machineId, takenAt, takenAt, peaks, laterReadingAt),
         takenAt,
         laterReadingAt,
         JSON.stringify(peaks),
@@ -480,7 +498,7 @@ async function recordTemporaryAnomaly(
   }
 
   const { rows } = await client.query<AnomalyRow>(
-    "SELECT id, timestamp, last_hot_at, later_reading_at, readings FROM alerts WHERE id = $1",
+    "SELECT id, timestamp, last_hot_at, readings FROM alerts WHERE id = $1",
     [action.alertId]
   );
   const current = rows[0];
@@ -493,21 +511,14 @@ async function recordTemporaryAnomaly(
   // information, so the alert asks for attention again.
   await client.query(
     `UPDATE alerts
-     SET timestamp = $2, last_hot_at = $3, readings = $4, message = $5,
-         acknowledged = acknowledged AND NOT $6
+     SET timestamp = $2, last_hot_at = $3, readings = $4,
+         acknowledged = acknowledged AND NOT $5
      WHERE id = $1`,
     [
       current.id,
       startedAt,
       lastHotAt,
       JSON.stringify(peaks),
-      temporaryAnomalyMessage(
-        machineId,
-        startedAt,
-        lastHotAt,
-        peaks,
-        current.later_reading_at
-      ),
       isPeakRaised(current.readings, peaks),
     ]
   );
@@ -522,27 +533,12 @@ async function endTemporaryAnomalyEarlier(
   machineId: string,
   takenAt: Date
 ): Promise<void> {
-  const { rows } = await client.query<AnomalyRow>(
-    `SELECT id, timestamp, last_hot_at, later_reading_at, readings FROM alerts
-     WHERE machine_id = $1 AND last_hot_at < $2 AND later_reading_at > $2`,
+  await client.query(
+    `UPDATE alerts SET later_reading_at = $2
+     WHERE machine_id = $1 AND kind = 'TEMPORARY_ANOMALY'
+       AND last_hot_at < $2 AND later_reading_at > $2`,
     [machineId, takenAt]
   );
-  for (const row of rows) {
-    await client.query(
-      "UPDATE alerts SET later_reading_at = $2, message = $3 WHERE id = $1",
-      [
-        row.id,
-        takenAt,
-        temporaryAnomalyMessage(
-          machineId,
-          row.timestamp,
-          row.last_hot_at,
-          row.readings,
-          takenAt
-        ),
-      ]
-    );
-  }
 }
 
 /**
@@ -628,15 +624,10 @@ async function processTelemetry(
 
       if (applied && shouldRaiseAlert(prev.status, newStatus)) {
         await client.query(
-          `INSERT INTO alerts (id, machine_id, severity, message, timestamp)
-           VALUES ($1, $2, 'WARNING', $3, $4)
+          `INSERT INTO alerts (id, machine_id, kind, severity, timestamp)
+           VALUES ($1, $2, 'ENTERED_WARNING', 'WARNING', $3)
            ON CONFLICT (machine_id, timestamp) DO NOTHING`,
-          [
-            `${machineId}-${randomUUID()}`,
-            machineId,
-            `Machine ${machineId} entered WARNING state`,
-            takenAt,
-          ]
+          [`${machineId}-${randomUUID()}`, machineId, takenAt]
         );
       } else if (
         // Not applied, inside the partition range and not from a clock that is
@@ -705,13 +696,30 @@ const typeDefs = `#graphql
     OFFLINE
   }
 
+  """
+  An alert carries data, not text: the client builds the sentence from kind
+  and the times, and formats the times in the viewer's time zone.
+  """
   type Alert {
     id: ID!
+    kind: AlertKind!
     severity: AlertSeverity!
-    message: String!
-    "Machine time of the reading that raised the alert."
+    "Machine time of the reading that raised the alert, or of the first hot reading of a TEMPORARY_ANOMALY."
     timestamp: String!
+    "TEMPORARY_ANOMALY only: machine time of the last hot reading."
+    lastHotAt: String
+    "TEMPORARY_ANOMALY only: machine time of the first stored reading after the period that is not hot."
+    laterReadingAt: String
+    "TEMPORARY_ANOMALY only: the highest temperature and rpm of the period."
+    readings: [KeyValue!]
     acknowledged: Boolean!
+  }
+
+  enum AlertKind {
+    "The machine's status changed into WARNING."
+    ENTERED_WARNING
+    "Hot readings that arrived after a newer reading that was not hot."
+    TEMPORARY_ANOMALY
   }
 
   enum AlertSeverity {
@@ -857,7 +865,8 @@ const resolvers = {
       const { rows } = await pool.query<AlertRow>(
         `UPDATE alerts SET acknowledged=TRUE
          WHERE id=$1 AND machine_id=$2
-         RETURNING id, severity, message, timestamp, acknowledged`,
+         RETURNING id, kind, severity, timestamp, last_hot_at, later_reading_at, readings,
+                   acknowledged`,
         [alertId, machineId]
       );
 
